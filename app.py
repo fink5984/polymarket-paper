@@ -49,7 +49,6 @@ def init_db():
         if not previous or previous[0] != DATA_EPOCH:
             c.execute("DELETE FROM samples")
             c.execute("DELETE FROM trades")
-            c.execute("DELETE FROM sqlite_sequence WHERE name='trades'")
             c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('data_epoch',?)",(DATA_EPOCH,))
             print(f"RESET COMPLETE epoch={DATA_EPOCH}: samples=0 trades=0", flush=True)
 
