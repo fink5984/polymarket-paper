@@ -11,12 +11,16 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "."))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB = DATA_DIR / "paper.db"
 INTERVAL = float(os.getenv("SAMPLE_SECONDS", "2"))
-EDGE_MIN = float(os.getenv("EDGE_MIN", "0.08"))
+EDGE_MIN = float(os.getenv("EDGE_MIN", "0.12"))
 STAKE = float(os.getenv("PAPER_STAKE", "10"))
 SLIPPAGE = float(os.getenv("SLIPPAGE", "0.01"))
 BANKROLL = float(os.getenv("PAPER_BANKROLL", "100"))
 RESET_TOKEN = os.getenv("RESET_TOKEN", "")
-DATA_EPOCH = "fresh-usd-zero-v2"
+DATA_EPOCH = "clean-ledger-v1"
+MIN_ENTRY_AGE = float(os.getenv("MIN_ENTRY_AGE", "45"))
+MIN_TIME_LEFT = float(os.getenv("MIN_TIME_LEFT", "45"))
+CONFIRMATIONS = int(os.getenv("SIGNAL_CONFIRMATIONS", "3"))
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.05"))
 assert os.getenv("PAPER_ONLY", "true").lower() == "true", "This service is paper-only"
 
 state = {"started": time.time(), "status": "starting", "market": None, "btc": None, "last_error": None}
@@ -35,7 +39,6 @@ def init_db():
         CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY, ts REAL, market_slug TEXT, side TEXT,
           ask REAL, fill_price REAL, model_p REAL, edge REAL, stake REAL, status TEXT DEFAULT 'open',
           result INTEGER, pnl REAL);
-        CREATE UNIQUE INDEX IF NOT EXISTS one_trade_side ON trades(market_slug, side);
         """)
         existing={r[1] for r in c.execute("PRAGMA table_info(trades)")}
         for name,sql in {
@@ -43,7 +46,9 @@ def init_db():
             "exit_ts":"ALTER TABLE trades ADD COLUMN exit_ts REAL",
             "exit_price":"ALTER TABLE trades ADD COLUMN exit_price REAL",
             "exit_reason":"ALTER TABLE trades ADD COLUMN exit_reason TEXT",
-            "managed_pnl":"ALTER TABLE trades ADD COLUMN managed_pnl REAL"}.items():
+            "managed_pnl":"ALTER TABLE trades ADD COLUMN managed_pnl REAL",
+            "entry_reason":"ALTER TABLE trades ADD COLUMN entry_reason TEXT",
+            "entered_seconds_left":"ALTER TABLE trades ADD COLUMN entered_seconds_left REAL"}.items():
             if name not in existing: c.execute(sql)
         previous=c.execute("SELECT value FROM meta WHERE key='data_epoch'").fetchone()
         if not previous or previous[0] != DATA_EPOCH:
@@ -51,10 +56,12 @@ def init_db():
             c.execute("DELETE FROM trades")
             c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('data_epoch',?)",(DATA_EPOCH,))
             print(f"RESET COMPLETE epoch={DATA_EPOCH}: samples=0 trades=0", flush=True)
+        c.execute("DROP INDEX IF EXISTS one_trade_side")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_trade_market ON trades(market_slug)")
 
 def wallet_available(c):
-    realized=c.execute("SELECT COALESCE(SUM(managed_pnl),0) FROM trades WHERE managed_pnl IS NOT NULL").fetchone()[0]
-    locked=c.execute("SELECT COALESCE(SUM(stake),0) FROM trades WHERE managed_status='open'").fetchone()[0]
+    realized=c.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE status='settled'").fetchone()[0]
+    locked=c.execute("SELECT COALESCE(SUM(stake),0) FROM trades WHERE status='open'").fetchone()[0]
     return BANKROLL + realized - locked
 
 async def get_json(client, url, params=None):
@@ -93,9 +100,10 @@ async def book(client, token):
     return (max(bids) if bids else None, min(asks) if asks else None)
 
 def probability(prices, current, opened, seconds_left):
-    if len(prices) < 8 or not opened: return 0.5
+    if len(prices) < 20 or not opened: return 0.5
     rets = [math.log(prices[i]/prices[i-1]) for i in range(1, len(prices))]
-    sigma = max(statistics.pstdev(rets), 0.00002) * math.sqrt(max(seconds_left/INTERVAL, 1))
+    # A conservative volatility floor prevents tiny opening moves from creating false 99% confidence.
+    sigma = max(statistics.pstdev(rets[-60:]), 0.00008) * math.sqrt(max(seconds_left/INTERVAL, 1))
     z = math.log(current/opened) / sigma
     return min(.995, max(.005, .5 * (1 + math.erf(z/math.sqrt(2)))))
 
@@ -113,34 +121,18 @@ async def settle_old(client):
                 for r in rows:
                     won = r["side"].lower() == winner
                     pnl = r["stake"] * ((1/r["fill_price"])-1) if won else -r["stake"]
-                    c.execute("UPDATE trades SET status='settled',result=?,pnl=? WHERE id=?",(int(won),pnl,r["id"]))
-                    c.execute("UPDATE trades SET managed_status='settled',managed_pnl=?,exit_reason='resolution',exit_ts=? WHERE id=? AND managed_status='open'",(pnl,time.time(),r["id"]))
+                    c.execute("UPDATE trades SET status='settled',result=?,pnl=?,managed_status='settled',managed_pnl=?,exit_reason='official_resolution',exit_ts=? WHERE id=?",
+                              (int(won),pnl,pnl,time.time(),r["id"]))
         except Exception: pass
 
-def manage_exits(c, market_slug, now, left, pup, up_bid, down_bid):
-    rows=c.execute("SELECT * FROM trades WHERE market_slug=? AND managed_status='open'",(market_slug,)).fetchall()
-    for r in rows:
-        bid=up_bid if r["side"].lower()=="up" else down_bid
-        side_p=pup if r["side"].lower()=="up" else 1-pup
-        if bid is None: continue
-        roi=bid/r["fill_price"]-1; age=now-r["ts"]; reason=None
-        if roi >= .35: reason="take_profit_35%"
-        elif roi <= -.30: reason="stop_loss_30%"
-        elif age >= 10 and side_p < .35: reason="model_reversal"
-        elif left <= 15 and bid < .97: reason="time_exit_15s"
-        if reason:
-            exit_price=max(.001,bid-SLIPPAGE)
-            managed_pnl=r["stake"]*(exit_price/r["fill_price"]-1)
-            c.execute("UPDATE trades SET managed_status='exited',exit_ts=?,exit_price=?,exit_reason=?,managed_pnl=? WHERE id=?",(now,exit_price,reason,managed_pnl,r["id"]))
-
 async def worker():
-    prices=[]; current_market=None; open_btc=None; last_settle=0
+    prices=[]; current_market=None; open_btc=None; candidate=None; confirmations=0
     async with httpx.AsyncClient(headers={"User-Agent":"paper-research/1.0"}) as client:
       while True:
         try:
             now=time.time(); epoch=int(now//300)*300
             if not current_market or current_market["end"] <= now:
-                current_market=await discover(client,epoch); prices=[]; open_btc=None
+                current_market=await discover(client,epoch); prices=[]; open_btc=None; candidate=None; confirmations=0
             px=await btc_price(client); prices=(prices+[px])[-150:]
             if open_btc is None: open_btc=px
             if current_market:
@@ -152,15 +144,28 @@ async def worker():
                 with conn() as c:
                     c.execute("INSERT OR REPLACE INTO samples VALUES(?,?,?,?,?,?,?,?,?,?)",
                               (now,current_market["slug"],left,px,open_btc,pup,ub,ua,db,da))
-                    manage_exits(c,current_market["slug"],now,left,pup,ub,db)
-                    for side,ask,model in (("Up",ua,pup),("Down",da,1-pup)):
-                        if ask and 0.03 < ask < .97 and model-ask >= EDGE_MIN and wallet_available(c) >= STAKE:
-                            fill=min(.99,ask+SLIPPAGE); edge=model-fill
-                            c.execute("INSERT OR IGNORE INTO trades(ts,market_slug,side,ask,fill_price,model_p,edge,stake,managed_status) VALUES(?,?,?,?,?,?,?,?,?)",
-                                      (now,current_market["slug"],side,ask,fill,model,edge,STAKE,"open"))
+                    already=c.execute("SELECT 1 FROM trades WHERE market_slug=?",(current_market["slug"],)).fetchone()
+                    choices=[]
+                    for side,bid,ask,model in (("Up",ub,ua,pup),("Down",db,da,1-pup)):
+                        if bid is not None and ask is not None and 0.03 < ask < .97 and ask-bid <= MAX_SPREAD:
+                            fill=min(.99,ask+SLIPPAGE); choices.append((model-fill,side,ask,fill,model))
+                    best=max(choices,default=None)
+                    eligible=(not already and best and best[0] >= EDGE_MIN and
+                              current_market["end"]-300+MIN_ENTRY_AGE <= now and left >= MIN_TIME_LEFT)
+                    if eligible:
+                        side=best[1]
+                        if candidate==side: confirmations+=1
+                        else: candidate=side; confirmations=1
+                        if confirmations >= CONFIRMATIONS and wallet_available(c) >= STAKE:
+                            edge,side,ask,fill,model=best
+                            c.execute("INSERT INTO trades(ts,market_slug,side,ask,fill_price,model_p,edge,stake,status,managed_status,entry_reason,entered_seconds_left) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                                      (now,current_market["slug"],side,ask,fill,model,edge,STAKE,"open","open","confirmed_momentum",left))
+                    else:
+                        candidate=None; confirmations=0
                 state.update(status="collecting",market=current_market["slug"],btc=px,last_error=None)
             else: state.update(status="waiting_for_market",btc=px)
-            if now-last_settle>60: await settle_old(client); last_settle=now
+            # Poll official resolution continuously after expiry instead of waiting a full minute.
+            await settle_old(client)
         except Exception as e:
             state.update(status="error",last_error=str(e)[:300])
         await asyncio.sleep(INTERVAL)
@@ -168,7 +173,7 @@ async def worker():
 def stats():
     with conn() as c:
         s=c.execute("SELECT COUNT(*) n, COUNT(DISTINCT market_slug) markets, MIN(ts) first, MAX(ts) last FROM samples").fetchone()
-        t=c.execute("SELECT COUNT(*) n, SUM(status='settled') settled, SUM(COALESCE(result,0)) wins, ROUND(SUM(COALESCE(pnl,0)),2) pnl FROM trades").fetchone()
+        t=c.execute("SELECT COUNT(*) n, SUM(status='settled') settled, SUM(status='open') open, SUM(COALESCE(result,0)) wins, ROUND(SUM(COALESCE(pnl,0)),2) pnl FROM trades").fetchone()
         recent=[dict(r) for r in c.execute("SELECT * FROM trades ORDER BY ts DESC LIMIT 20")]
         current=c.execute("SELECT * FROM samples ORDER BY ts DESC LIMIT 1").fetchone()
         series=[dict(r) for r in c.execute("SELECT ts,seconds_left,btc,open_btc,p_up,up_bid,up_ask,down_bid,down_ask FROM samples WHERE market_slug=(SELECT market_slug FROM samples ORDER BY ts DESC LIMIT 1) ORDER BY ts DESC LIMIT 180")]
@@ -186,7 +191,10 @@ def stats():
                 ended = int(trade["market_slug"].rsplit("-",1)[1]) + 300 <= time.time()
             except (ValueError, IndexError):
                 ended = False
-            trade["display_status"] = "נסגר" if trade["status"]=="settled" else ("ממתין להכרעה" if ended else "פתוח")
+            if trade["status"]=="settled":
+                trade["display_status"] = "הוכרעה · זכייה" if trade["result"] else "הוכרעה · הפסד"
+            else:
+                trade["display_status"] = "החלון הסתיים · אימות רשמי" if ended else "פתוחה"
             mark_total += trade["display_pnl"] or 0
     td=dict(t); td["win_rate"] = round(100*(td["wins"] or 0)/(td["settled"] or 1),1); td["mark_pnl"]=round(mark_total,2)
     def group(rows, keyfn, value="pnl"):
@@ -209,15 +217,12 @@ def stats():
       "by_side":group(settled,lambda x:x["side"]),
       "by_price":group(settled,lambda x:"0-.20" if x["fill_price"]<.2 else ".20-.40" if x["fill_price"]<.4 else ".40-.60" if x["fill_price"]<.6 else ".60-.80" if x["fill_price"]<.8 else ".80-1"),
       "by_edge":group(settled,lambda x:"<10%" if x["edge"]<.1 else "10-15%" if x["edge"]<.15 else "15-20%" if x["edge"]<.2 else "20%+")}
-    managed_pnls=[x["managed_pnl"] for x in managed]
-    analysis["managed"]={"trades":len(managed),"pnl":round(sum(managed_pnls),2),
-      "avg_pnl":round(sum(managed_pnls)/len(managed_pnls),2) if managed_pnls else 0,
-      "wins":sum(1 for x in managed_pnls if x>0),
-      "by_reason":group(managed,lambda x:x["exit_reason"] or "unknown","managed_pnl")}
-    analysis["managed"]["win_rate"]=round(100*analysis["managed"]["wins"]/len(managed_pnls),1) if managed_pnls else 0
+    analysis["strategy"]={"name":"Confirmed Momentum · Hold to Resolution","edge_min":EDGE_MIN,
+      "min_entry_age":MIN_ENTRY_AGE,"min_time_left":MIN_TIME_LEFT,"confirmations":CONFIRMATIONS,
+      "max_spread":MAX_SPREAD,"one_trade_per_market":True}
     with conn() as c:
-        realized=c.execute("SELECT COALESCE(SUM(managed_pnl),0) FROM trades WHERE managed_pnl IS NOT NULL").fetchone()[0]
-        open_rows=c.execute("SELECT side,fill_price,stake,market_slug FROM trades WHERE managed_status='open'").fetchall()
+        realized=c.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE status='settled'").fetchone()[0]
+        open_rows=c.execute("SELECT side,fill_price,stake,market_slug FROM trades WHERE status='open'").fetchall()
         unrealized=0.0
         for x in open_rows:
             q=c.execute("SELECT up_bid,down_bid FROM samples WHERE market_slug=? ORDER BY ts DESC LIMIT 1",(x["market_slug"],)).fetchone()
@@ -225,7 +230,8 @@ def stats():
             if mark is not None: unrealized += x["stake"]*(mark/x["fill_price"]-1)
         locked=sum(x["stake"] for x in open_rows)
     wallet={"initial":BANKROLL,"balance":round(BANKROLL+realized,2),"available":round(BANKROLL+realized-locked,2),
-            "locked":round(locked,2),"unrealized":round(unrealized,2),"equity":round(BANKROLL+realized+unrealized,2)}
+            "locked":round(locked,2),"unrealized":round(unrealized,2),"equity":round(BANKROLL+realized+unrealized,2),
+            "realized_pnl":round(realized,2)}
     return {"samples":dict(s),"trades":td,"recent":recent,"current":dict(current) if current else None,
             "series":list(reversed(series)),"analysis":analysis,"wallet":wallet,"runtime":state,"server_time":time.time()}
 
@@ -249,11 +255,11 @@ const usd=x=>x==null?'—':'$'+Number(x).toLocaleString(undefined,{maximumFracti
 const cent=x=>x==null?'—':(x*100).toFixed(1)+'¢'; const pct=x=>x==null?'—':(x*100).toFixed(1)+'%';
 function chart(canvas, rows, keys, colors, probability=false){let ctx=canvas.getContext('2d'),w=canvas.clientWidth,h=canvas.clientHeight,d=devicePixelRatio||1;canvas.width=w*d;canvas.height=h*d;ctx.scale(d,d);ctx.clearRect(0,0,w,h);let pad=60;ctx.direction='ltr';ctx.textAlign='left';if(rows.length<2){ctx.fillStyle='#8499b4';ctx.fillText('Waiting for data...',pad,h/2);return}let vals=rows.flatMap(r=>keys.map(k=>r[k]).filter(x=>x!=null)),mn=probability?0:Math.min(...vals),mx=probability?1:Math.max(...vals);if(mx==mn){mx+=1;mn-=1}ctx.strokeStyle='#213650';ctx.fillStyle='#c5d5e8';ctx.font='bold 12px Arial';for(let i=0;i<=4;i++){let y=20+(h-40)*i/4;ctx.beginPath();ctx.moveTo(pad,y);ctx.lineTo(w-8,y);ctx.stroke();let value=mx-(mx-mn)*i/4,label=probability?(value*100).toFixed(0)+'c':'$'+value.toLocaleString(undefined,{maximumFractionDigits:0});ctx.fillText(label,3,y+4)}keys.forEach((k,ki)=>{ctx.strokeStyle=colors[ki];ctx.lineWidth=2.5;ctx.beginPath();let started=false;rows.forEach((r,i)=>{if(r[k]==null)return;let x=pad+(w-pad-10)*i/(rows.length-1),y=20+(h-40)*(mx-r[k])/(mx-mn);started?ctx.lineTo(x,y):ctx.moveTo(x,y);started=true});ctx.stroke()})}
 function render(d){let s=d.samples,t=d.trades,r=d.runtime,c=d.current||{},rows=d.series||[],up=c.up_ask,down=c.down_ask,model=c.p_up,delta=c.btc&&c.open_btc?(c.btc/c.open_btc-1):null,left=Math.max(0,Math.round(c.seconds_left||0));document.getElementById('market').textContent=r.market||'ממתין לשוק';document.getElementById('live').innerHTML=`<i class="dot"></i><span class="live">LIVE</span> · עודכן ${new Date((s.last||d.server_time)*1000).toLocaleTimeString('he-IL')}`;document.getElementById('app').innerHTML=`
-<div class="grid"><div class="card"><div class="label">נותר בחלון</div><div class="v amber">${Math.floor(left/60)}:${String(left%60).padStart(2,'0')}</div><div class="mini">חלון של 5 דקות</div></div><div class="card"><div class="label">BTC עכשיו</div><div class="v">${money(c.btc||r.btc)}</div><div class="mini">פתיחה: ${money(c.open_btc)}</div></div><div class="card"><div class="label">שינוי מהפתיחה</div><div class="v ${delta>=0?'up':'down'}">${delta==null?'—':(delta*100).toFixed(3)+'%'}</div><div class="mini">מודל UP: ${pct(model)}</div></div><div class="card"><div class="label">Polymarket UP</div><div class="v up">${cent(up)}</div><div class="mini">Bid ${cent(c.up_bid)} · Ask ${cent(up)}</div></div><div class="card"><div class="label">Polymarket DOWN</div><div class="v down">${cent(down)}</div><div class="mini">Bid ${cent(c.down_bid)} · Ask ${cent(down)}</div></div><div class="card"><div class="label">Edge הטוב כרגע</div><div class="v">${Math.max(model-(up||1),(1-model)-(down||1),0)*100|0}%</div><div class="mini">סף כניסה: 8%</div></div></div>
+<div class="grid"><div class="card"><div class="label">נותר בחלון</div><div class="v amber">${Math.floor(left/60)}:${String(left%60).padStart(2,'0')}</div><div class="mini">חלון של 5 דקות</div></div><div class="card"><div class="label">BTC עכשיו</div><div class="v">${money(c.btc||r.btc)}</div><div class="mini">פתיחה: ${money(c.open_btc)}</div></div><div class="card"><div class="label">שינוי מהפתיחה</div><div class="v ${delta>=0?'up':'down'}">${delta==null?'—':(delta*100).toFixed(3)+'%'}</div><div class="mini">מודל UP: ${pct(model)}</div></div><div class="card"><div class="label">Polymarket UP</div><div class="v up">${cent(up)}</div><div class="mini">Bid ${cent(c.up_bid)} · Ask ${cent(up)}</div></div><div class="card"><div class="label">Polymarket DOWN</div><div class="v down">${cent(down)}</div><div class="mini">Bid ${cent(c.down_bid)} · Ask ${cent(down)}</div></div><div class="card"><div class="label">Edge הטוב כרגע</div><div class="v">${Math.max(model-(up||1),(1-model)-(down||1),0)*100|0}%</div><div class="mini">סף 12% · 3 אישורים</div></div></div>
 <div class="charts"><div class="panel"><h2>מחיר BTC בתוך החלון</h2><div class="legend"><span><i class="sw" style="background:#4ea1ff"></i>BTC</span><span><i class="sw" style="background:#ffd166"></i>מחיר פתיחה</span></div><div class="range"><span>נמוך <b>${money(Math.min(...rows.map(x=>x.btc||Infinity)))}</b></span><span>עכשיו <b>${money(c.btc)}</b></span><span>גבוה <b>${money(Math.max(...rows.map(x=>x.btc||0)))}</b></span></div><div class="chartbox"><canvas id="btcChart"></canvas></div></div><div class="panel"><h2>Polymarket מול המודל</h2><div class="legend"><span><i class="sw" style="background:#45e69a"></i>UP Ask</span><span><i class="sw" style="background:#ff6575"></i>DOWN Ask</span><span><i class="sw" style="background:#b584ff"></i>Model UP</span></div><div class="range"><span>UP <b class="up">${cent(up)}</b></span><span>מודל <b>${cent(model)}</b></span><span>DOWN <b class="down">${cent(down)}</b></span></div><div class="bar"><span style="width:${(up||.5)*100}%"></span></div><div class="chartbox"><canvas id="polyChart"></canvas></div></div></div>
 <h2>הארנק המדומה</h2><div class="grid"><div class="card"><div class="label">שווי הארנק</div><div class="v ${d.wallet.equity>=d.wallet.initial?'up':'down'}">${usd(d.wallet.equity)}</div></div><div class="card"><div class="label">יתרה ממומשת</div><div class="v">${usd(d.wallet.balance)}</div></div><div class="card"><div class="label">כסף פנוי</div><div class="v">${usd(d.wallet.available)}</div></div><div class="card"><div class="label">בעסקאות פתוחות</div><div class="v amber">${usd(d.wallet.locked)}</div></div><div class="card"><div class="label">רווח פתוח</div><div class="v ${d.wallet.unrealized>=0?'up':'down'}">${usd(d.wallet.unrealized)}</div></div><div class="card"><div class="label">הפקדה התחלתית</div><div class="v">${usd(d.wallet.initial)}</div></div></div>
-<div class="grid"><div class="card"><div class="label">חלונות שנאספו</div><div class="v">${s.markets||0}</div></div><div class="card"><div class="label">דגימות שוק</div><div class="v">${s.n||0}</div><div class="mini">תצפיות, לא עסקאות</div></div><div class="card"><div class="label">עסקאות מדומות</div><div class="v">${t.n||0}</div></div><div class="card"><div class="label">נסגרו / הצליחו</div><div class="v">${t.settled||0} / ${t.wins||0}</div><div class="mini">Win rate: ${t.win_rate||0}%</div></div><div class="card"><div class="label">P&L סופי</div><div class="v ${(t.pnl||0)>=0?'up':'down'}">${usd(t.pnl||0)}</div><div class="mini">עסקאות שהוכרעו</div></div><div class="card"><div class="label">P&L נוכחי</div><div class="v ${(t.mark_pnl||0)>=0?'up':'down'}">${usd(t.mark_pnl||0)}</div><div class="mini">כולל עסקאות פתוחות</div></div></div>
-<section id="analysis"><h2>ניתוח מצטבר</h2><div class="grid"><div class="card"><div class="label">רווחים גולמיים</div><div class="v up">${usd(d.analysis.gross_profit)}</div></div><div class="card"><div class="label">הפסדים גולמיים</div><div class="v down">${usd(-d.analysis.gross_loss)}</div></div><div class="card"><div class="label">Profit Factor</div><div class="v">${d.analysis.profit_factor||'—'}</div></div><div class="card"><div class="label">ממוצע לעסקה</div><div class="v">${usd(d.analysis.avg_pnl)}</div></div><div class="card"><div class="label">חציון לעסקה</div><div class="v">${usd(d.analysis.median_pnl)}</div></div><div class="card"><div class="label">5 הזכיות הגדולות</div><div class="v">${d.analysis.top5_profit_share}%</div><div class="mini">מסך הרווחים הגולמיים</div></div></div><h2>בדיקת יציאה חכמה — מהיום</h2><div class="grid"><div class="card"><div class="label">עסקאות שיצאו</div><div class="v">${d.analysis.managed.trades}</div></div><div class="card"><div class="label">P&L ביציאה חכמה</div><div class="v ${d.analysis.managed.pnl>=0?'up':'down'}">${usd(d.analysis.managed.pnl)}</div></div><div class="card"><div class="label">הצלחה ביציאות</div><div class="v">${d.analysis.managed.win_rate}%</div></div><div class="card"><div class="label">ממוצע ליציאה</div><div class="v">${usd(d.analysis.managed.avg_pnl)}</div></div></div><div class="mini">Take profit 35% · Stop loss 30% · היפוך מודל · יציאה 15 שניות לפני הסיום. ההשוואה מתחילה מהגרסה הנוכחית בלבד.</div><div class="scroll"><table><tr><th>קבוצה</th><th>עסקאות</th><th>הצלחות</th><th>Win rate</th><th>P&L</th></tr>${Object.entries({...d.analysis.by_side,...d.analysis.by_price,...d.analysis.by_edge}).map(([k,x])=>`<tr><td>${k}</td><td>${x.trades}</td><td>${x.wins}</td><td>${x.win_rate}%</td><td class="${x.pnl>=0?'up':'down'}">${usd(x.pnl)}</td></tr>`).join('')}</table></div></section>
+<div class="grid"><div class="card"><div class="label">חלונות שנאספו</div><div class="v">${s.markets||0}</div></div><div class="card"><div class="label">דגימות שוק</div><div class="v">${s.n||0}</div><div class="mini">תצפיות, לא עסקאות</div></div><div class="card"><div class="label">עסקאות מדומות</div><div class="v">${t.n||0}</div><div class="mini">מקסימום אחת לחלון</div></div><div class="card"><div class="label">הוכרעו / הצליחו</div><div class="v">${t.settled||0} / ${t.wins||0}</div><div class="mini">Win rate: ${t.win_rate||0}%</div></div><div class="card"><div class="label">P&L ממומש</div><div class="v ${(d.wallet.realized_pnl||0)>=0?'up':'down'}">${usd(d.wallet.realized_pnl||0)}</div><div class="mini">מקור האמת של הארנק</div></div><div class="card"><div class="label">עסקאות פתוחות</div><div class="v">${t.open||0}</div><div class="mini">רווח פתוח: ${usd(d.wallet.unrealized)}</div></div></div>
+<section id="analysis"><h2>האסטרטגיה הפעילה</h2><div class="grid"><div class="card"><div class="label">שם</div><div class="v" style="font-size:17px">Momentum מאושר</div><div class="mini">החזקה עד הכרעה רשמית</div></div><div class="card"><div class="label">זמן המתנה</div><div class="v">45 שנ׳</div></div><div class="card"><div class="label">Edge מינימלי</div><div class="v">12%</div></div><div class="card"><div class="label">אישור אות</div><div class="v">3×</div><div class="mini">דגימות רצופות</div></div><div class="card"><div class="label">Spread מרבי</div><div class="v">5¢</div></div><div class="card"><div class="label">חשיפה</div><div class="v">$10</div><div class="mini">עסקה אחת לחלון</div></div></div><h2>ניתוח מצטבר</h2><div class="grid"><div class="card"><div class="label">רווחים גולמיים</div><div class="v up">${usd(d.analysis.gross_profit)}</div></div><div class="card"><div class="label">הפסדים גולמיים</div><div class="v down">${usd(-d.analysis.gross_loss)}</div></div><div class="card"><div class="label">Profit Factor</div><div class="v">${d.analysis.profit_factor||'—'}</div></div><div class="card"><div class="label">ממוצע לעסקה</div><div class="v">${usd(d.analysis.avg_pnl)}</div></div><div class="card"><div class="label">חציון לעסקה</div><div class="v">${usd(d.analysis.median_pnl)}</div></div><div class="card"><div class="label">5 הזכיות הגדולות</div><div class="v">${d.analysis.top5_profit_share}%</div></div></div><div class="scroll"><table><tr><th>קבוצה</th><th>עסקאות</th><th>הצלחות</th><th>Win rate</th><th>P&L</th></tr>${Object.entries({...d.analysis.by_side,...d.analysis.by_price,...d.analysis.by_edge}).map(([k,x])=>`<tr><td>${k}</td><td>${x.trades}</td><td>${x.wins}</td><td>${x.win_rate}%</td><td class="${x.pnl>=0?'up':'down'}">${usd(x.pnl)}</td></tr>`).join('')}</table></div></section>
 <h2>עסקאות מדומות אחרונות</h2><div class="scroll"><table><tr><th>זמן</th><th>צד</th><th>כניסה</th><th>עכשיו</th><th>מודל</th><th>Edge</th><th>מצב</th><th>רווח/הפסד</th></tr>${d.recent.map(x=>`<tr><td>${new Date(x.ts*1000).toLocaleTimeString('he-IL',{hour:'2-digit',minute:'2-digit'})}</td><td class="${x.side==='Up'?'up':'down'}">${x.side}</td><td>${cent(x.fill_price)}</td><td>${cent(x.mark_price)}</td><td>${pct(x.model_p)}</td><td>${pct(x.edge)}</td><td class="status">${x.display_status}</td><td class="${(x.display_pnl||0)>=0?'up':'down'}">${x.display_pnl==null?'—':usd(x.display_pnl)}</td></tr>`).join('')}</table></div>${r.last_error?'<p class="err">'+r.last_error+'</p>':''}`;chart(document.getElementById('btcChart'),rows,['btc','open_btc'],['#4ea1ff','#ffd166']);chart(document.getElementById('polyChart'),rows,['up_ask','down_ask','p_up'],['#45e69a','#ff6575','#b584ff'],true)}
 async function load(){try{let d=await(await fetch('/api/stats',{cache:'no-store'})).json();window.__lastData=d;render(d)}catch(e){document.getElementById('live').textContent='שגיאת חיבור'}}load();setInterval(load,2000);addEventListener('resize',load);
 </script></html>''')
