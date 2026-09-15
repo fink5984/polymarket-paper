@@ -16,7 +16,7 @@ STAKE = float(os.getenv("PAPER_STAKE", "10"))
 SLIPPAGE = float(os.getenv("SLIPPAGE", "0.01"))
 BANKROLL = float(os.getenv("PAPER_BANKROLL", "100"))
 RESET_TOKEN = os.getenv("RESET_TOKEN", "")
-DATA_EPOCH = "fresh-usd-zero-v1"
+DATA_EPOCH = "fresh-usd-zero-v2"
 assert os.getenv("PAPER_ONLY", "true").lower() == "true", "This service is paper-only"
 
 state = {"started": time.time(), "status": "starting", "market": None, "btc": None, "last_error": None}
@@ -135,7 +135,7 @@ def manage_exits(c, market_slug, now, left, pup, up_bid, down_bid):
             c.execute("UPDATE trades SET managed_status='exited',exit_ts=?,exit_price=?,exit_reason=?,managed_pnl=? WHERE id=?",(now,exit_price,reason,managed_pnl,r["id"]))
 
 async def worker():
-    init_db(); prices=[]; current_market=None; open_btc=None; last_settle=0
+    prices=[]; current_market=None; open_btc=None; last_settle=0
     async with httpx.AsyncClient(headers={"User-Agent":"paper-research/1.0"}) as client:
       while True:
         try:
@@ -232,6 +232,7 @@ def stats():
 
 @asynccontextmanager
 async def lifespan(app):
+    init_db()
     task=asyncio.create_task(worker()); yield; task.cancel()
 
 app=FastAPI(title="Polymarket BTC 5m Paper Lab",lifespan=lifespan)
