@@ -16,6 +16,7 @@ STAKE = float(os.getenv("PAPER_STAKE", "10"))
 SLIPPAGE = float(os.getenv("SLIPPAGE", "0.01"))
 BANKROLL = float(os.getenv("PAPER_BANKROLL", "100"))
 RESET_TOKEN = os.getenv("RESET_TOKEN", "")
+DATA_EPOCH = "fresh-usd-zero-v1"
 assert os.getenv("PAPER_ONLY", "true").lower() == "true", "This service is paper-only"
 
 state = {"started": time.time(), "status": "starting", "market": None, "btc": None, "last_error": None}
@@ -44,13 +45,13 @@ def init_db():
             "exit_reason":"ALTER TABLE trades ADD COLUMN exit_reason TEXT",
             "managed_pnl":"ALTER TABLE trades ADD COLUMN managed_pnl REAL"}.items():
             if name not in existing: c.execute(sql)
-        previous=c.execute("SELECT value FROM meta WHERE key='reset_token'").fetchone()
-        if RESET_TOKEN and (not previous or previous[0] != RESET_TOKEN):
+        previous=c.execute("SELECT value FROM meta WHERE key='data_epoch'").fetchone()
+        if not previous or previous[0] != DATA_EPOCH:
             c.execute("DELETE FROM samples")
             c.execute("DELETE FROM trades")
             c.execute("DELETE FROM sqlite_sequence WHERE name='trades'")
-            c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('reset_token',?)",(RESET_TOKEN,))
-            print(f"RESET COMPLETE token={RESET_TOKEN}: samples=0 trades=0", flush=True)
+            c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('data_epoch',?)",(DATA_EPOCH,))
+            print(f"RESET COMPLETE epoch={DATA_EPOCH}: samples=0 trades=0", flush=True)
 
 def wallet_available(c):
     realized=c.execute("SELECT COALESCE(SUM(managed_pnl),0) FROM trades WHERE managed_pnl IS NOT NULL").fetchone()[0]
