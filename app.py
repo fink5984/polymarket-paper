@@ -131,6 +131,7 @@ def stats():
         recent=[dict(r) for r in c.execute("SELECT * FROM trades ORDER BY ts DESC LIMIT 20")]
         current=c.execute("SELECT * FROM samples ORDER BY ts DESC LIMIT 1").fetchone()
         series=[dict(r) for r in c.execute("SELECT ts,seconds_left,btc,open_btc,p_up,up_bid,up_ask,down_bid,down_ask FROM samples WHERE market_slug=(SELECT market_slug FROM samples ORDER BY ts DESC LIMIT 1) ORDER BY ts DESC LIMIT 180")]
+        settled=[dict(r) for r in c.execute("SELECT * FROM trades WHERE status='settled' ORDER BY ts")]
     mark_total=0.0
     with conn() as c:
         for trade in recent:
@@ -146,8 +147,27 @@ def stats():
             trade["display_status"] = "נסגר" if trade["status"]=="settled" else ("ממתין להכרעה" if ended else "פתוח")
             mark_total += trade["display_pnl"] or 0
     td=dict(t); td["win_rate"] = round(100*(td["wins"] or 0)/(td["settled"] or 1),1); td["mark_pnl"]=round(mark_total,2)
+    def group(rows, keyfn):
+        out={}
+        for x in rows:
+            k=keyfn(x); z=out.setdefault(k,{"trades":0,"wins":0,"pnl":0.0})
+            z["trades"]+=1; z["wins"]+=int(x["result"] or 0); z["pnl"]+=x["pnl"] or 0
+        for z in out.values(): z["pnl"]=round(z["pnl"],2); z["win_rate"]=round(100*z["wins"]/z["trades"],1)
+        return out
+    pnls=sorted([x["pnl"] for x in settled if x["pnl"] is not None])
+    gross_profit=sum(x for x in pnls if x>0); gross_loss=-sum(x for x in pnls if x<0)
+    winners=sorted((x for x in pnls if x>0),reverse=True)
+    analysis={"gross_profit":round(gross_profit,2),"gross_loss":round(gross_loss,2),
+      "profit_factor":round(gross_profit/gross_loss,2) if gross_loss else None,
+      "avg_pnl":round(sum(pnls)/len(pnls),2) if pnls else 0,
+      "median_pnl":round(statistics.median(pnls),2) if pnls else 0,
+      "best_trade":round(max(pnls),2) if pnls else 0,"worst_trade":round(min(pnls),2) if pnls else 0,
+      "top5_profit_share":round(100*sum(winners[:5])/gross_profit,1) if gross_profit else 0,
+      "by_side":group(settled,lambda x:x["side"]),
+      "by_price":group(settled,lambda x:"0-.20" if x["fill_price"]<.2 else ".20-.40" if x["fill_price"]<.4 else ".40-.60" if x["fill_price"]<.6 else ".60-.80" if x["fill_price"]<.8 else ".80-1"),
+      "by_edge":group(settled,lambda x:"<10%" if x["edge"]<.1 else "10-15%" if x["edge"]<.15 else "15-20%" if x["edge"]<.2 else "20%+")}
     return {"samples":dict(s),"trades":td,"recent":recent,"current":dict(current) if current else None,
-            "series":list(reversed(series)),"runtime":state,"server_time":time.time()}
+            "series":list(reversed(series)),"analysis":analysis,"runtime":state,"server_time":time.time()}
 
 @asynccontextmanager
 async def lifespan(app):
@@ -171,5 +191,5 @@ function render(d){let s=d.samples,t=d.trades,r=d.runtime,c=d.current||{},rows=d
 <div class="charts"><div class="panel"><h2>מחיר BTC בתוך החלון</h2><div class="legend"><span><i class="sw" style="background:#4ea1ff"></i>BTC</span><span><i class="sw" style="background:#ffd166"></i>מחיר פתיחה</span></div><div class="range"><span>נמוך <b>${money(Math.min(...rows.map(x=>x.btc||Infinity)))}</b></span><span>עכשיו <b>${money(c.btc)}</b></span><span>גבוה <b>${money(Math.max(...rows.map(x=>x.btc||0)))}</b></span></div><div class="chartbox"><canvas id="btcChart"></canvas></div></div><div class="panel"><h2>Polymarket מול המודל</h2><div class="legend"><span><i class="sw" style="background:#45e69a"></i>UP Ask</span><span><i class="sw" style="background:#ff6575"></i>DOWN Ask</span><span><i class="sw" style="background:#b584ff"></i>Model UP</span></div><div class="range"><span>UP <b class="up">${cent(up)}</b></span><span>מודל <b>${cent(model)}</b></span><span>DOWN <b class="down">${cent(down)}</b></span></div><div class="bar"><span style="width:${(up||.5)*100}%"></span></div><div class="chartbox"><canvas id="polyChart"></canvas></div></div></div>
 <div class="grid"><div class="card"><div class="label">חלונות שנאספו</div><div class="v">${s.markets||0}</div></div><div class="card"><div class="label">דגימות שוק</div><div class="v">${s.n||0}</div><div class="mini">תצפיות, לא עסקאות</div></div><div class="card"><div class="label">עסקאות מדומות</div><div class="v">${t.n||0}</div></div><div class="card"><div class="label">נסגרו / הצליחו</div><div class="v">${t.settled||0} / ${t.wins||0}</div><div class="mini">Win rate: ${t.win_rate||0}%</div></div><div class="card"><div class="label">P&L סופי</div><div class="v ${(t.pnl||0)>=0?'up':'down'}">${money(t.pnl||0)}</div><div class="mini">עסקאות שהוכרעו</div></div><div class="card"><div class="label">P&L נוכחי</div><div class="v ${(t.mark_pnl||0)>=0?'up':'down'}">${money(t.mark_pnl||0)}</div><div class="mini">כולל עסקאות פתוחות</div></div></div>
 <h2>עסקאות מדומות אחרונות</h2><div class="scroll"><table><tr><th>זמן</th><th>צד</th><th>כניסה</th><th>עכשיו</th><th>מודל</th><th>Edge</th><th>מצב</th><th>רווח/הפסד</th></tr>${d.recent.map(x=>`<tr><td>${new Date(x.ts*1000).toLocaleTimeString('he-IL',{hour:'2-digit',minute:'2-digit'})}</td><td class="${x.side==='Up'?'up':'down'}">${x.side}</td><td>${cent(x.fill_price)}</td><td>${cent(x.mark_price)}</td><td>${pct(x.model_p)}</td><td>${pct(x.edge)}</td><td class="status">${x.display_status}</td><td class="${(x.display_pnl||0)>=0?'up':'down'}">${x.display_pnl==null?'—':money(x.display_pnl)}</td></tr>`).join('')}</table></div>${r.last_error?'<p class="err">'+r.last_error+'</p>':''}`;chart(document.getElementById('btcChart'),rows,['btc','open_btc'],['#4ea1ff','#ffd166']);chart(document.getElementById('polyChart'),rows,['up_ask','down_ask','p_up'],['#45e69a','#ff6575','#b584ff'],true)}
-async function load(){try{render(await(await fetch('/api/stats',{cache:'no-store'})).json())}catch(e){document.getElementById('live').textContent='שגיאת חיבור'}}load();setInterval(load,2000);addEventListener('resize',load);
+async function load(){try{let d=await(await fetch('/api/stats',{cache:'no-store'})).json();window.__lastData=d;render(d)}catch(e){document.getElementById('live').textContent='שגיאת חיבור'}}load();setInterval(load,2000);addEventListener('resize',load);
 </script></html>''')
